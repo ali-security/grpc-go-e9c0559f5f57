@@ -281,7 +281,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 	)
 	t.logger = prefixLoggerForServerTransport(t)
 
-	t.controlBuf = newControlBuffer(t.done)
+	t.controlBuf = newControlBuffer(t.done, serverSide)
 	if dynamicWindow {
 		t.bdpEst = &bdpEstimator{
 			bdp:               initialWindowSize,
@@ -806,7 +806,10 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 		}
 		if f.Header().Flags.Has(http2.FlagDataPadded) {
 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
+				t.controlBuf.put(&outgoingWindowUpdate{
+					streamID:  s.id,
+					increment: w,
+				})
 			}
 		}
 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
@@ -947,7 +950,7 @@ func (t *http2Server) checkForHeaderListSize(it any) bool {
 	if t.maxSendHeaderListSize == nil {
 		return true
 	}
-	hdrFrame := it.(*headerFrame)
+	hdrFrame := it.(*serverHeaders)
 	var sz int64
 	for _, f := range hdrFrame.hf {
 		if sz += int64(f.Size()); sz > int64(*t.maxSendHeaderListSize) {
@@ -1013,7 +1016,7 @@ func (t *http2Server) writeHeaderLocked(s *Stream) error {
 		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-encoding", Value: s.sendCompress})
 	}
 	headerFields = appendHeaderFieldsFromMD(headerFields, s.header)
-	hf := &headerFrame{
+	hf := &serverHeaders{
 		streamID:  s.id,
 		hf:        headerFields,
 		endStream: false,
@@ -1082,7 +1085,7 @@ func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 
 	// Attach the trailer metadata.
 	headerFields = appendHeaderFieldsFromMD(headerFields, s.trailer)
-	trailingHeader := &headerFrame{
+	trailingHeader := &serverHeaders{
 		streamID:  s.id,
 		hf:        headerFields,
 		endStream: true,
@@ -1282,7 +1285,7 @@ func (t *http2Server) deleteStream(s *Stream, eosReceived bool) {
 }
 
 // finishStream closes the stream and puts the trailing headerFrame into controlbuf.
-func (t *http2Server) finishStream(s *Stream, rst bool, rstCode http2.ErrCode, hdr *headerFrame, eosReceived bool) {
+func (t *http2Server) finishStream(s *Stream, rst bool, rstCode http2.ErrCode, hdr *serverHeaders, eosReceived bool) {
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
@@ -1414,7 +1417,7 @@ func (t *http2Server) getOutFlowWindow() int64 {
 	resp := make(chan uint32, 1)
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
-	t.controlBuf.put(&outFlowControlSizeRequest{resp})
+	t.controlBuf.put(&outFlowControlSizeRequest{resp: resp})
 	select {
 	case sz := <-resp:
 		return int64(sz)

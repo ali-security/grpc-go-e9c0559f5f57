@@ -59,6 +59,13 @@ import (
 // atomically.
 var clientConnectionCounter uint64
 
+// clientThrottleTimeout is the maximum amount of time for which the client
+// stops reading from the connection because too many frames queued in
+// response to the server (see maxQueuedTransportResponseFrames) are waiting
+// to be written. After that, the client closes the connection instead of
+// waiting forever, since the server is most likely not reading.
+var clientThrottleTimeout = 10 * time.Second
+
 var metadataFromOutgoingContextRaw = internal.FromOutgoingContextRaw.(func(context.Context) (metadata.MD, [][]string, bool))
 
 // http2Client implements the ClientTransport interface with HTTP2.
@@ -100,6 +107,12 @@ type http2Client struct {
 
 	kp               keepalive.ClientParameters
 	keepaliveEnabled bool
+
+	// throttleTimeout is the maximum amount of time for which reads can
+	// stay throttled before the connection is closed. It is copied from
+	// clientThrottleTimeout on creation, so that tests can override the
+	// latter without racing with the readers of other transports.
+	throttleTimeout time.Duration
 
 	statsHandlers []stats.Handler
 
@@ -346,6 +359,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 		streamQuota:           defaultMaxStreamsClient,
 		streamsQuotaAvailable: make(chan struct{}, 1),
 		keepaliveEnabled:      keepaliveEnabled,
+		throttleTimeout:       clientThrottleTimeout,
 		bufferPool:            newBufferPool(),
 		onClose:               onClose,
 	}
@@ -373,7 +387,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
 	} else if md := imetadata.Get(addr); md != nil {
 		t.md = md
 	}
-	t.controlBuf = newControlBuffer(t.ctxDone)
+	t.controlBuf = newControlBuffer(t.ctxDone, clientSide)
 	if opts.InitialWindowSize >= defaultWindowSize {
 		t.initialWindowSize = opts.InitialWindowSize
 		dynamicWindow = false
@@ -767,9 +781,8 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*Stream,
 			close(s.headerChan)
 		}
 	}
-	hdr := &headerFrame{
-		hf:        headerFields,
-		endStream: false,
+	hdr := &clientHeaders{
+		hf: headerFields,
 		initStream: func(id uint32) error {
 			t.mu.Lock()
 			// TODO: handle transport closure in loopy instead and remove this
@@ -1183,7 +1196,10 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
 		}
 		if f.Header().Flags.Has(http2.FlagDataPadded) {
 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
+				t.controlBuf.put(&outgoingWindowUpdate{
+					streamID:  s.id,
+					increment: w,
+				})
 			}
 		}
 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
@@ -1614,9 +1630,23 @@ func (t *http2Client) reader(errCh chan<- error) {
 		atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
 	}
 
-	// loop to keep reading incoming messages on this transport.
+	// Loop to keep reading incoming messages on this transport.
 	for {
-		t.controlBuf.throttle()
+		// Stop reading while too many items that the server can make
+		// the client queue (see cbItem.isTransportResponseFrame) are
+		// waiting to be written, to bound the memory that a server
+		// can make the client use by flooding it without reading. If
+		// reads stay throttled for t.throttleTimeout, close the
+		// connection instead of waiting forever.
+		if err := t.controlBuf.throttleWithTimeout(t.throttleTimeout); err != nil {
+			t.logger.Warningf("Closing connection since the server is not reading: %v", err)
+			// The writer is most likely blocked writing to the server,
+			// and closing the transport waits for the writer to exit.
+			// Close the connection first to unblock the writer.
+			t.conn.Close()
+			t.Close(connectionErrorf(true, err, "closing connection since the server is not reading: %v", err))
+			return
+		}
 		frame, err := t.framer.fr.ReadFrame()
 		if t.keepaliveEnabled {
 			atomic.StoreInt64(&t.lastRead, time.Now().UnixNano())
@@ -1788,7 +1818,7 @@ func (t *http2Client) getOutFlowWindow() int64 {
 	resp := make(chan uint32, 1)
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
-	t.controlBuf.put(&outFlowControlSizeRequest{resp})
+	t.controlBuf.put(&outFlowControlSizeRequest{resp: resp})
 	select {
 	case sz := <-resp:
 		return int64(sz)
