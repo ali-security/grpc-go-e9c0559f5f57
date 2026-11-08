@@ -383,7 +383,7 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 	}
 	t.maxStreamID = streamID
 
-	buf := newRecvBuffer()
+	buf := newRecvBuffer(t.bufferPool)
 	s := &Stream{
 		id:               streamID,
 		st:               t,
