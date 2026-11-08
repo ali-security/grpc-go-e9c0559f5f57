@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -53,6 +54,9 @@ func (f failingProvider) KeyMaterial(context.Context) (*certprovider.KeyMaterial
 func (f failingProvider) Close() {}
 
 func (s) TestFailingProvider(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("cert file paths embedded in JSON config; Windows `\\` breaks JSON escape parsing")
+	}
 	s := stubserver.StartTestService(t, nil, grpc.Creds(e2e.CreateServerTLSCredentials(t, tls.RequireAndVerifyClientCert)))
 	defer s.Stop()
 

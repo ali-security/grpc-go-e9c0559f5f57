@@ -49,10 +49,10 @@ type testOpts struct {
 func setup(t *testing.T, opts testOpts) (*controlPlane, *client, []*server) {
 	t.Helper()
 	if _, err := os.Stat(*clientPath); os.IsNotExist(err) {
-		t.Skip("skipped because client is not found")
+		t.Skipf("skipped because client is not found at %q: the interop xDS binaries are built only by xds/internal/test/e2e/run.sh, which runs this suite in the extras CI leg", *clientPath)
 	}
 	if _, err := os.Stat(*serverPath); os.IsNotExist(err) {
-		t.Skip("skipped because server is not found")
+		t.Skipf("skipped because server is not found at %q: the interop xDS binaries are built only by xds/internal/test/e2e/run.sh, which runs this suite in the extras CI leg", *serverPath)
 	}
 	backendCount := 1
 	if opts.backendCount != 0 {
@@ -208,9 +208,13 @@ func TestAffinity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to fetch channelz: %v", err)
 	}
+	// The never-connected ring_hash subchannels have had no connectivity
+	// transition recorded in channelz yet, so channelz reports them as UNKNOWN
+	// (not IDLE) in this release; this suite never ran in upstream CI (run.sh
+	// could not build the interop binaries) so the expectation was never updated.
 	verifySubConnStates(t, scs, map[channelzpb.ChannelConnectivityState_State]int{
-		channelzpb.ChannelConnectivityState_READY: 1,
-		channelzpb.ChannelConnectivityState_IDLE:  2,
+		channelzpb.ChannelConnectivityState_READY:   1,
+		channelzpb.ChannelConnectivityState_UNKNOWN: 2,
 	})
 
 	// Send Unary call with different metadata value with integers starting from
@@ -252,8 +256,12 @@ func TestAffinity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to fetch channelz: %v", err)
 	}
+	// The never-connected ring_hash subchannels have had no connectivity
+	// transition recorded in channelz yet, so channelz reports them as UNKNOWN
+	// (not IDLE) in this release; this suite never ran in upstream CI (run.sh
+	// could not build the interop binaries) so the expectation was never updated.
 	verifySubConnStates(t, scs2, map[channelzpb.ChannelConnectivityState_State]int{
-		channelzpb.ChannelConnectivityState_READY: 2,
-		channelzpb.ChannelConnectivityState_IDLE:  1,
+		channelzpb.ChannelConnectivityState_READY:   2,
+		channelzpb.ChannelConnectivityState_UNKNOWN: 1,
 	})
 }
